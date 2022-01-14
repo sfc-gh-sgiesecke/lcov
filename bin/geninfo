@@ -172,7 +172,7 @@ sub solve_relative_path($$);
 sub read_gcov_header($);
 sub read_gcov_file($);
 sub info(@);
-sub process_intermediate($$$);
+sub process_intermediate($$@);
 sub map_llvm_version($);
 sub version_to_str($);
 sub get_gcov_version();
@@ -852,14 +852,16 @@ sub gen_info($)
 	$tempdir = tempdir(CLEANUP => 1);
 
 	# Process all files in list
-	foreach $file (@file_list) {
-		# Process file
-		if ($intermediate) {
-			process_intermediate($file, $prefix, $tempdir);
-		} elsif ($initial) {
-			process_graphfile($file, $prefix);
-		} else {
-			process_dafile($file, $prefix);
+	if ($intermediate) {
+		process_intermediate($prefix, $tempdir, @file_list);
+	} else {
+		foreach $file (@file_list) {
+			# Process file
+			if ($initial) {
+				process_graphfile($file, $prefix);
+			} else {
+				process_dafile($file, $prefix);
+			}
 		}
 	}
 
@@ -2473,17 +2475,17 @@ sub print_gcov_warnings($$$)
 
 
 #
-# process_intermediate(file, dir, tempdir)
+# process_intermediate(file_list, dir, tempdir)
 #
-# Create output for a single file (either a data file or a graph file) using
+# Create output for a list of files (either data files or graph files) using
 # gcov's intermediate option.
 #
 
-sub process_intermediate($$$)
+sub process_intermediate($$@)
 {
-	my ($file, $dir, $tempdir) = @_;
+	my ($dir, $tempdir, @file_list) = @_;
 	my ($fdir, $fbase, $fext);
-	my $data_file;
+	my %data_file_hash;
 	my $errmsg;
 	my %data;
 	my $fd;
@@ -2494,24 +2496,29 @@ sub process_intermediate($$$)
 	my $json_basedir;
 	my $json_format;
 
-	info("Processing %s\n", abs2rel($file, $dir));
+	foreach my $file (@file_list) {
+		info("Processing %s\n", abs2rel($file, $dir));
 
-	$file = solve_relative_path($cwd, $file);
-	($fdir, $fbase, $fext) = split_filename($file);
+		$file = solve_relative_path($cwd, $file);
+		($fdir, $fbase, $fext) = split_filename($file);
 
-	$is_graph = 1 if (".$fext" eq $graph_file_extension);
+		# TODO Either all files must be graph files or none. 
+		$is_graph = 1 if (".$fext" eq $graph_file_extension);
 
-	if ($is_graph) {
-		# Process graph file - copy to temp directory to prevent
-		# accidental processing of associated data file
-		$data_file = "$tempdir/$fbase$graph_file_extension";
-		if (!copy($file, $data_file)) {
-			$errmsg = "ERROR: Could not copy file $file";
-			goto err;
+		if ($is_graph) {
+			# Process graph file - copy to temp directory to prevent
+			# accidental processing of associated data file
+			my $data_file = "$tempdir/$fbase$graph_file_extension";
+			if (!copy($file, $data_file)) {
+				$errmsg = "ERROR: Could not copy file $file";
+				goto err;
+			}
+
+			$data_file_hash{$data_file} = $file;
+		} else {
+			# Process data file in place
+			$data_file_hash{$file} = $file;
 		}
-	} else {
-		# Process data file in place
-		$data_file = $file;
 	}
 
 	# Change directory
@@ -2520,24 +2527,24 @@ sub process_intermediate($$$)
 		goto err;
 	}
 
-	# Run gcov on data file
+	# Run gcov on all data files
 	($out, $err, $rc) = system_no_output(1 + 2 + 4, $gcov_tool,
-					     $data_file, @gcov_options, "-i");
+					   keys %data_file_hash, @gcov_options, "-i");
 	defined($out) && unlink($out);
 	if (defined($err)) {
-		print_gcov_warnings($err, $is_graph, {
-			$data_file => $file,
-		});
+		print_gcov_warnings($err, $is_graph, \%data_file_hash);
 		unlink($err);
 	}
 	if ($rc) {
-		$errmsg = "GCOV failed for $file";
+		$errmsg = "GCOV failed for %data_file_hash";
 		goto err;
 	}
 
 	if ($is_graph) {
-		# Remove graph file copy
-		unlink($data_file);
+		# Remove graph file copies
+		for (keys %data_file_hash) {
+			unlink($_);
+		}
 	}
 
 	# Parse resulting file(s)
@@ -2553,7 +2560,7 @@ sub process_intermediate($$$)
 	}
 
 	if (!%data) {
-		warn("WARNING: GCOV did not produce any data for $file\n");
+		warn("WARNING: GCOV did not produce any data for %data_file_hash\n");
 		return;
 	}
 
@@ -2588,13 +2595,15 @@ sub process_intermediate($$$)
 	}
 
 	# Generate output
-	$fd = get_output_fd($output_filename, $file);
-	if ($json_format) {
-		intermediate_json_to_info($fd, \%data, $srcdata);
-	} else {
-		intermediate_text_to_info($fd, \%data, $srcdata);
+	for (keys %data_file_hash) {
+		$fd = get_output_fd($output_filename, $data_file_hash{$_});
+		if ($json_format) {
+			intermediate_json_to_info($fd, \%data, $srcdata);
+		} else {
+			intermediate_text_to_info($fd, \%data, $srcdata);
+		}
+		close($fd);
 	}
-	close($fd);
 
 	chdir($cwd);
 
